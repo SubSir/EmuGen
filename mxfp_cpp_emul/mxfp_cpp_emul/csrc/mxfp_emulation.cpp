@@ -1,4 +1,5 @@
-// NVFP4 scaled GEMM accuracy emulation using libtorch (matches nvfp_kernel/emulation/core.py).
+// MXFP4 scaled GEMM accuracy emulation using libtorch (matches mxfp.py layout: E8M0 scales,
+// SWIZZLED_128x4, group_size 32). No NVFP alpha; no 4-to-1 reduction — linear K accumulation.
 #include <torch/extension.h>
 #include <vector>
 #include <cmath>
@@ -13,7 +14,7 @@ torch::Tensor make_fp4_e2m1_table(const torch::Device& device) {
       vals, torch::TensorOptions().dtype(torch::kFloat16).device(device));
 }
 
-torch::Tensor swizzled_to_linear_128_4(const torch::Tensor& a_sf, int64_t mn, int64_t k) {
+torch::Tensor swizzled_to_linear_128_4(const torch::Tensor& a_sf, int64_t mn, int64_t num_sf_columns) {
   auto sizes = a_sf.sizes();
   TORCH_CHECK(sizes.size() == 2, "scale tensor must be 2D");
   int64_t mn_padded = sizes[0];
@@ -24,10 +25,14 @@ torch::Tensor swizzled_to_linear_128_4(const torch::Tensor& a_sf, int64_t mn, in
               "swizzled scale shape must be divisible by 128 and 4");
   auto tmp = a_sf.reshape({m_tiles, k_tiles, 32, 4, 4}).transpose(1, 3);
   auto out = tmp.reshape({mn_padded, sf_k_padded});
-  return out.narrow(0, 0, mn).narrow(1, 0, k);
+  return out.narrow(0, 0, mn).narrow(1, 0, num_sf_columns);
 }
 
-torch::Tensor unpack_nvfp4_to_fp16(const torch::Tensor& packed, c10::IntArrayRef original_shape) {
+torch::Tensor mxfp4_scale_uint8_to_float(const torch::Tensor& scale_u8) {
+  return torch::exp2(scale_u8.to(torch::kFloat32) - 127.f);
+}
+
+torch::Tensor unpack_mxfp4_to_fp16(const torch::Tensor& packed, c10::IntArrayRef original_shape) {
   auto table = make_fp4_e2m1_table(packed.device());
   auto p = packed.to(torch::kUInt8);
   auto low = torch::bitwise_and(p, 0x0F);
@@ -39,7 +44,6 @@ torch::Tensor unpack_nvfp4_to_fp16(const torch::Tensor& packed, c10::IntArrayRef
   return selected;
 }
 
-// rounding: 0 = RZ (toward zero), 1 = RNE (default float cast)
 torch::Tensor to_float32_with_rounding(const torch::Tensor& tensor_f64, int rounding) {
   if (rounding == 0) {
     auto f32 = tensor_f64.to(torch::kFloat32);
@@ -48,29 +52,6 @@ torch::Tensor to_float32_with_rounding(const torch::Tensor& tensor_f64, int roun
     return torch::where(mask, torch::nextafter(f32, z), f32);
   }
   return tensor_f64.to(torch::kFloat32);
-}
-
-torch::Tensor hardware_reduction_4to1(
-    const std::vector<torch::Tensor>& v_list,
-    int64_t W,
-    bool output_fp32,
-    int rounding) {
-  auto stacked = torch::stack(v_list, 0);
-  auto max_val = std::get<0>(stacked.abs().max(0));
-  auto max_exp = std::get<1>(torch::frexp(max_val));
-  auto w0 = torch::scalar_tensor(
-      static_cast<double>(W), max_val.options().dtype(torch::kFloat64));
-  auto scale = torch::exp2(w0 - max_exp.to(torch::kFloat64));
-
-  torch::Tensor v_aligned_sum = torch::zeros_like(v_list[0], torch::dtype(torch::kFloat64));
-  for (const auto& v : v_list) {
-    v_aligned_sum = v_aligned_sum + torch::trunc(v.to(torch::kFloat64) * scale);
-  }
-  auto summed_f64 = v_aligned_sum / scale;
-  if (output_fp32) {
-    return to_float32_with_rounding(summed_f64, rounding);
-  }
-  return summed_f64;
 }
 
 torch::Tensor hardware_add_wbits(
@@ -100,92 +81,83 @@ torch::Tensor stage1_inner_mma_fp16(const torch::Tensor& val_a, const torch::Ten
   return partial.permute({0, 2, 1});
 }
 
+// (mn, G32) with one scale per group_size K elements -> (mn, K/16), each G32 column repeated
+// for two consecutive 16-K chunks (mxfp.py: s_per_k from G to K).
+torch::Tensor expand_mxfp_scale_to_k16(const torch::Tensor& s_g32, int64_t k16) {
+  auto sizes = s_g32.sizes();
+  TORCH_CHECK(sizes.size() == 2, "scale must be 2D");
+  int64_t mn = sizes[0];
+  int64_t g32 = sizes[1];
+  TORCH_CHECK(k16 == 2 * g32, "K/16 must equal 2 * (K/group_size) for MXFP4 group_size 32");
+  return s_g32.unsqueeze(-1).expand({mn, g32, 2}).reshape({mn, k16});
+}
+
 }  // namespace
 
-torch::Tensor emulated_scaled_fp4_mm(
+torch::Tensor emulated_mxfp4_mm(
     const torch::Tensor& a_fp4,
     const torch::Tensor& b_fp4,
     const torch::Tensor& scale_a,
     const torch::Tensor& scale_b,
-    const torch::Tensor& alpha,
-    int64_t w_stage3,
-    int64_t w_stage4,
+    int64_t group_size,
+    int64_t w_accum,
     int64_t m_chunk_size,
-    int stage3_rounding,
-    int stage4_rounding) {
+    int accum_rounding) {
   TORCH_CHECK(a_fp4.dim() == 2 && b_fp4.dim() == 2, "a_fp4, b_fp4 must be 2D");
+  TORCH_CHECK(group_size == 32, "only MXFP4 group_size=32 is supported");
   int64_t M = a_fp4.size(0);
   int64_t N = b_fp4.size(0);
   int64_t K = a_fp4.size(1) * 2;
   TORCH_CHECK(b_fp4.size(1) * 2 == K, "K mismatch between a and b");
+  TORCH_CHECK(K % group_size == 0, "K must be divisible by group_size");
   TORCH_CHECK(K % 16 == 0, "K must be multiple of 16");
-  int64_t G = K / 16;
-  TORCH_CHECK(G % 4 == 0, "G = K/16 must be multiple of 4");
-  int64_t num_4_groups = G / 4;
+  int64_t G32 = K / group_size;
+  int64_t K16 = K / 16;
+  TORCH_CHECK(K16 == 2 * G32, "internal: K/16 vs K/group_size");
 
-  auto val_b_fp16 = unpack_nvfp4_to_fp16(b_fp4, {N, K});
-  auto s_b = swizzled_to_linear_128_4(scale_b, N, G).to(torch::kFloat32);
-  auto s_a_all = swizzled_to_linear_128_4(scale_a, M, G).to(torch::kFloat32);
-  auto val_a_fp16_all = unpack_nvfp4_to_fp16(a_fp4, {M, K});
+  auto val_b_fp16 = unpack_mxfp4_to_fp16(b_fp4, {N, K});
+  auto s_b_u8 = swizzled_to_linear_128_4(scale_b, N, G32);
+  auto s_a_u8 = swizzled_to_linear_128_4(scale_a, M, G32);
+  auto s_b = mxfp4_scale_uint8_to_float(s_b_u8);
+  auto s_a_all = mxfp4_scale_uint8_to_float(s_a_u8);
+  auto val_a_fp16_all = unpack_mxfp4_to_fp16(a_fp4, {M, K});
+
+  auto s_a_k16 = expand_mxfp_scale_to_k16(s_a_all, K16);
+  auto s_b_k16 = expand_mxfp_scale_to_k16(s_b, K16);
 
   std::vector<torch::Tensor> chunks;
   for (int64_t m_start = 0; m_start < M; m_start += m_chunk_size) {
     int64_t m_end = std::min(m_start + m_chunk_size, M);
     int64_t curr_m = m_end - m_start;
     auto val_a_chunk = val_a_fp16_all.narrow(0, m_start, curr_m);
-    auto s_a_chunk = s_a_all.narrow(0, m_start, curr_m);
+    auto s_a_k16_chunk = s_a_k16.narrow(0, m_start, curr_m);
 
     auto ps1 = stage1_inner_mma_fp16(val_a_chunk, val_b_fp16);
-    auto combined = s_a_chunk.unsqueeze(1) * s_b.unsqueeze(0);
-    auto scaled_partials = ps1.to(torch::kFloat32) * combined;
-    auto grouped = scaled_partials.view({curr_m, N, num_4_groups, 4});
-    std::vector<torch::Tensor> v_list = {
-        grouped.select(-1, 0),
-        grouped.select(-1, 1),
-        grouped.select(-1, 2),
-        grouped.select(-1, 3)};
+    auto combined = s_a_k16_chunk.unsqueeze(1) * s_b_k16.unsqueeze(0);
+    auto scaled = ps1.to(torch::kFloat32) * combined;
 
-    torch::Tensor summed_groups;
-    if (num_4_groups == 1) {
-      summed_groups = hardware_reduction_4to1(
-          v_list, w_stage3, /*output_fp32=*/true, stage3_rounding);
-    } else {
-      summed_groups = hardware_reduction_4to1(
-          v_list, w_stage3, /*output_fp32=*/false, stage3_rounding);
+    auto acc = to_float32_with_rounding(scaled.select(-1, 0), accum_rounding);
+    for (int64_t kk = 1; kk < K16; ++kk) {
+      acc = hardware_add_wbits(acc, scaled.select(-1, kk), w_accum, accum_rounding);
     }
-
-    torch::Tensor summed_chunk;
-    if (num_4_groups == 1) {
-      summed_chunk = summed_groups.squeeze(-1);
-    } else {
-      auto acc = to_float32_with_rounding(summed_groups.select(-1, 0), stage4_rounding);
-      for (int64_t i = 1; i < num_4_groups; ++i) {
-        acc = hardware_add_wbits(
-            acc, summed_groups.select(-1, i), w_stage4, stage4_rounding);
-      }
-      summed_chunk = acc;
-    }
-    chunks.push_back(summed_chunk);
+    chunks.push_back(acc);
   }
 
   auto summed = torch::cat(chunks, 0);
-  double alpha_val = alpha.item<double>();
-  return (summed * alpha_val).to(torch::kFloat16);
+  return summed.to(torch::kBFloat16);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def(
-      "emulated_scaled_fp4_mm",
-      &emulated_scaled_fp4_mm,
-      "NVFP4 scaled GEMM emulation (libtorch, matches core MMAEngine.emulation_scaled_fp4_mm)",
+      "emulated_mxfp4_mm",
+      &emulated_mxfp4_mm,
+      "MXFP4 scaled GEMM emulation (libtorch; E8M0 scales, group 32, linear K accumulate)",
       pybind11::arg("a_fp4"),
       pybind11::arg("b_fp4"),
       pybind11::arg("scale_a"),
       pybind11::arg("scale_b"),
-      pybind11::arg("alpha"),
-      pybind11::arg("w_stage3") = 25,
-      pybind11::arg("w_stage4") = 25,
+      pybind11::arg("group_size") = 32,
+      pybind11::arg("w_accum") = 25,
       pybind11::arg("m_chunk_size") = 128,
-      pybind11::arg("stage3_rounding") = 0,
-      pybind11::arg("stage4_rounding") = 0);
+      pybind11::arg("accum_rounding") = 0);
 }

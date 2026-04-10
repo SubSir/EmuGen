@@ -1,6 +1,8 @@
 import torch
 import flashinfer
 
+from mxfp_cpp_emul import emulated_mxfp4_mm
+
 # E2M1: code in low 3 bits = magnitude, bit 3 = sign (same table as mxfp_emulation / dequant.cpp LUT)
 _FP4_LUT = torch.tensor(
     [
@@ -89,9 +91,13 @@ if __name__ == "__main__":
     a_fp4, a_scale = flashinfer.mxfp4_quantize(a)
     b_fp4, b_scale = flashinfer.mxfp4_quantize(b)
 
-    a_deq = dequant_mxfp4(a_fp4, a_scale, group_size=32, out_dtype=torch.bfloat16)
-    b_deq = dequant_mxfp4(b_fp4, b_scale, group_size=32, out_dtype=torch.bfloat16)
-    print("dequant max abs err vs a (row 1, cols 0:2):", (a_deq - a).abs().max().item())
+    out_emul = emulated_mxfp4_mm(
+        a_fp4,
+        b_fp4,
+        a_scale,
+        b_scale,
+        group_size=32,
+    )
 
     out = flashinfer.gemm.mm_fp4(
         a=a_fp4,
@@ -109,4 +115,4 @@ if __name__ == "__main__":
     print(f"Output dtype: {out.dtype}")
     print(out)
 
-    print((a_deq @ b_deq.T - out).abs().max().item())
+    print("emulated_mxfp4_mm vs mm_fp4 max abs err:", (out_emul - out).abs().max().item())

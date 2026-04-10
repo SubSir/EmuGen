@@ -1,7 +1,7 @@
 """
-MXFP4: ``flashinfer.gemm.mm_fp4`` (real) vs dequantized BF16 matmul (reference emulation).
+MXFP4: ``flashinfer.gemm.mm_fp4`` (real) vs C++ libtorch emulation (``emulated_mxfp4_mm``).
 
-Uses ``mxfp.dequant_mxfp4`` from ``mxfp_cpp_emul/mxfp.py`` (directory added to ``sys.path``).
+The ``mxfp_cpp_emul`` directory is added to ``sys.path`` so ``mxfp_cpp_emul`` can be imported.
 """
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ def build_mxfp_fns(
     mm_backend: str = "cudnn",
 ):
     import flashinfer
-    from mxfp import dequant_mxfp4
+    from mxfp_cpp_emul import emulated_mxfp4_mm
 
     def quant_fn(a: torch.Tensor, b: torch.Tensor) -> MXFPQuantState:
         a_fp4, a_scale = flashinfer.mxfp4_quantize(a)
@@ -66,19 +66,14 @@ def build_mxfp_fns(
         )
 
     def emul_fn(state: MXFPQuantState) -> torch.Tensor:
-        a_deq = dequant_mxfp4(
+        out = emulated_mxfp4_mm(
             state.a_fp4,
-            state.a_scale,
-            group_size=state.group_size,
-            out_dtype=state.out_dtype,
-        )
-        b_deq = dequant_mxfp4(
             state.b_fp4,
+            state.a_scale,
             state.b_scale,
             group_size=state.group_size,
-            out_dtype=state.out_dtype,
         )
-        return a_deq @ b_deq.T
+        return out.to(state.out_dtype)
 
     meta: dict[str, Any] = {
         "backend": "mxfp",
