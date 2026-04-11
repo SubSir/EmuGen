@@ -63,7 +63,7 @@ def build_nvfp_fns(
     def quant_fn(a: torch.Tensor, b: torch.Tensor) -> NVFPQuantState:
         a_gs = global_scale_nvfp(a)
         b_gs = global_scale_nvfp(b)
-        alpha_val = 1.0 / (a_gs.item() * b_gs.item())
+        alpha_val = 1.0 / max(a_gs.item() * b_gs.item(), 1e-8)
         alpha = torch.tensor([alpha_val], device=a.device, dtype=torch.float32)
         a_fp4, scale_a = ops.scaled_fp4_quant(a, a_gs)
         b_fp4, scale_b = ops.scaled_fp4_quant(b, b_gs)

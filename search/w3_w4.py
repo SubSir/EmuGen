@@ -1,9 +1,12 @@
 import argparse
+import random
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from gemm_compare.data import DataGenerator
 from search.emulation import (
     SearchNVFPEmulationState,
     emulate_nvfp_scaled_fp4_mm,
@@ -21,45 +24,72 @@ parser.add_argument(
     choices=("mxfp", "nvfp"),
     help="mxfp: flashinfer mm_fp4; nvfp: Cutlass scaled fp4",
 )
+parser.add_argument(
+    "--seed",
+    type=int,
+    default=None,
+    help="RNG seed (default: time/urandom, same style as gemm_compare.runner)",
+)
 args = parser.parse_args()
+
+DISTRIBUTIONS = [
+    "normal",
+    "uniform",
+    "large",
+    "outliers",
+    "mixed_rows",
+    "abs_large",
+]
+
+SHAPE = (1024, 64)
+DEVICE = "cuda"
+
+seed = args.seed
+if seed is None:
+    seed = int(time.time() * 1e6) ^ int.from_bytes(__import__("os").urandom(8), "little")
+random.seed(seed)
+torch.manual_seed(seed)
+if DEVICE == "cuda" and torch.cuda.is_available():
+    torch.cuda.manual_seed_all(seed)
+print("seed =", seed)
 
 GROUP_SIZE = 32 if args.backend == "mxfp" else 16
 ab_dtype = torch.float16
-A = torch.zeros(256, 256, dtype=ab_dtype, device="cuda")
-B = torch.zeros(256, 256, dtype=ab_dtype, device="cuda")
 
 quant_fn, real_fn, emul_fn, meta = build_gemm_compare_fns(args.backend, out_dtype=ab_dtype)
 
-W_CANDIDATES = range(20, 50)
-M_VALUES = range(0, 3699)
-
-
-def set_group(X: torch.Tensor, i: int, j: float, group_size: int):
-  for k in range(group_size):
-    X[0, i * group_size + k] = j
-
-
 def emu_matches_real(real_out: torch.Tensor, emu_out: torch.Tensor) -> bool:
+  nan_real = torch.isnan(real_out)
+  nan_emu = torch.isnan(emu_out)
+  if not torch.equal(nan_real, nan_emu):
+    return False
+  real_out = real_out[~nan_real]
+  emu_out = emu_out[~nan_emu]
+
+  inf_real = torch.isinf(real_out)
+  inf_emu = torch.isinf(emu_out)
+  if not torch.equal(inf_real, inf_emu):
+    return False
+  # Same positions are inf; still require same sign (isinf mask alone is not enough).
+  if inf_real.any() and not torch.equal(
+    torch.sign(real_out[inf_real]), torch.sign(emu_out[inf_emu])
+  ):
+    return False
+  real_out = real_out[~inf_real]
+  emu_out = emu_out[~inf_emu]
+
   return torch.allclose(real_out, emu_out, rtol=0.0, atol=0.0)
 
-
+W_CANDIDATES = range(33, 50)
 survivors = list(W_CANDIDATES)
-for M in M_VALUES:
-  M = float(M)
-  set_group(A, 0, M, GROUP_SIZE)
-  set_group(B, 0, M, GROUP_SIZE)
 
-  A[0, GROUP_SIZE+1] = 1.0
-  B[0, GROUP_SIZE+1] = 1.0
-
-  set_group(A, 4, -M, GROUP_SIZE)
-  set_group(B, 4, M, GROUP_SIZE)
+while True:
+  da, db = random.choice(DISTRIBUTIONS), random.choice(DISTRIBUTIONS)
+  A = DataGenerator.get_random_tensor(SHAPE, da, device=DEVICE, dtype=ab_dtype)
+  B = DataGenerator.get_random_tensor(SHAPE, db, device=DEVICE, dtype=ab_dtype)
 
   state = quant_fn(A, B)
   real_out = real_fn(state)
-  print(real_out[0, 0].item())
-  if real_out[0, 0].item() ==  0.0:
-    break
 
   next_survivors = []
   for w3 in survivors:
@@ -72,6 +102,6 @@ for M in M_VALUES:
     if emu_matches_real(real_out, out):
       next_survivors.append(w3)
   survivors = next_survivors
-  print(f"M={M} survivors={survivors}")
-  if not survivors:
+  print(f"survivors={survivors} | A={da} B={db}")
+  if len(survivors) <= 1:
     break
