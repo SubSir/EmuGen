@@ -22,7 +22,7 @@ ab_dtype = torch.float16
 A = torch.zeros(256, 256, dtype=ab_dtype, device="cuda")
 B = torch.zeros(256, 256, dtype=ab_dtype, device="cuda")
 
-quant_fn, real_fn, emul_fn, meta = build_gemm_compare_fns(args.backend)
+quant_fn, real_fn, emul_fn, meta = build_gemm_compare_fns(args.backend, out_dtype=ab_dtype)
 
 
 def set_group(X: torch.Tensor, i: int, j: float, group_size: int):
