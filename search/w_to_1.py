@@ -18,7 +18,6 @@ args = parser.parse_args()
 
 M = 28672.0
 GROUP_SIZE = 32 if args.backend == "mxfp" else 16
-# NVFP path uses fp16 by default in build_nvfp_fns; mxfp uses bf16.
 ab_dtype = torch.float16
 A = torch.zeros(256, 256, dtype=ab_dtype, device="cuda")
 B = torch.zeros(256, 256, dtype=ab_dtype, device="cuda")
