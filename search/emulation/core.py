@@ -71,12 +71,14 @@ class MMAEngine:
     """NVFP4 scaled GEMM emulation (Python reference)."""
 
     @staticmethod
-    def stage1_inner_mma_fp16(val_a, val_b):
+    def stage1_inner_mma_fp16(val_a, val_b, group_size: int = 16):
         M, K = val_a.shape
         N, _ = val_b.shape
-        K_groups = K // 16
-        a_grouped = val_a.view(M, K_groups, 16).to(torch.float16)
-        b_grouped = val_b.view(N, K_groups, 16).to(torch.float16)
+        if K % group_size != 0:
+            raise ValueError(f"K ({K}) must be divisible by group_size ({group_size})")
+        K_groups = K // group_size
+        a_grouped = val_a.view(M, K_groups, group_size).to(torch.float16)
+        b_grouped = val_b.view(N, K_groups, group_size).to(torch.float16)
         partial_sum1 = torch.einsum("mgk,ngk->mgn", a_grouped, b_grouped).to(torch.float16)
         return partial_sum1.permute(0, 2, 1)
 
@@ -96,18 +98,19 @@ class MMAEngine:
         stage3_rounding: RoundStrategy | int = RoundStrategy.RZ,
         stage4_rounding: RoundStrategy | int = RoundStrategy.RZ,
         m_chunk_size=128,
+        group_size: int = 16,
         unpack_fp4: Optional[Callable[[torch.Tensor, tuple[int, ...]], torch.Tensor]] = None,
         linearize_block_scales: Optional[Callable[[torch.Tensor, int, int], torch.Tensor]] = None,
     ):
-        """NVFP4 MMA emulation with M-chunking. Pass ``unpack_fp4`` / ``linearize_block_scales`` or use NVFP defaults."""
+        """Scaled FP4 MMA emulation with M-chunking. ``group_size`` is the K tile for stage-1 dots (NVFP 16, MXFP 32)."""
         stage3_rounding = coerce_round_strategy(stage3_rounding)
         stage4_rounding = coerce_round_strategy(stage4_rounding)
         unpack = unpack_fp4 or nvfp_unpack_fp4_to_fp16
         linearize = linearize_block_scales or nvfp_swizzled_block_scale_to_linear
 
-        assert K % 16 == 0, "K must be multiple of 16 (group size)"
-        G = K // 16
-        assert G % w_reduce == 0, f"G=K/16 ({G}) must be divisible by w_reduce ({w_reduce})"
+        assert K % group_size == 0, f"K must be multiple of group_size ({group_size})"
+        G = K // group_size
+        assert G % w_reduce == 0, f"G=K/group_size ({G}) must be divisible by w_reduce ({w_reduce})"
         num_blocks = G // w_reduce
 
         val_b_fp16 = unpack(b_fp4, (N, K))
@@ -122,7 +125,11 @@ class MMAEngine:
             val_a_chunk = val_a_fp16_all[m_start:m_end, :]
             s_a_chunk = s_a_all[m_start:m_end, :]
 
-            ps1_chunk = MMAEngine.stage1_inner_mma_fp16(val_a_chunk, val_b_fp16)
+            ps1_chunk = MMAEngine.stage1_inner_mma_fp16(
+                val_a_chunk, val_b_fp16, group_size=group_size
+            )
+            if group_size == 32:
+                s_a_chunk = s_a_chunk.double() # MXFP needs double precision for scale alignment
             combined_scales_chunk = s_a_chunk.unsqueeze(1) * s_b.unsqueeze(0)
             scaled_partials_chunk = ps1_chunk.float() * combined_scales_chunk
 

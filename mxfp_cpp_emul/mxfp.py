@@ -53,6 +53,26 @@ def unpack_mxfp4_indices(packed: torch.Tensor) -> torch.Tensor:
     return stacked.reshape(*p.shape[:-1], p.shape[-1] * 2).to(torch.long)
 
 
+def unpack_mxfp4_to_fp16(packed: torch.Tensor, original_shape: tuple[int, ...]) -> torch.Tensor:
+    """Packed uint8 (2 nibbles/byte) -> float16 matrix; same E2M1 LUT as ``_FP4_LUT``."""
+    lut = _FP4_LUT.to(device=packed.device, dtype=torch.float32)
+    idx = unpack_mxfp4_indices(packed)
+    vals = lut[idx].reshape(original_shape)
+    return vals.to(torch.float16)
+
+
+def mxfp_swizzled_scale_to_linear_fp32(
+    scale_swizzled: torch.Tensor, rows: int, num_groups: int
+) -> torch.Tensor:
+    """
+    Swizzled E8M0 uint8 -> linear float32 ``(rows, num_groups)``.
+
+    ``num_groups`` is ``K // group_size`` from the MMA emulator (for MXFP4, ``group_size`` is 32).
+    """
+    u8 = swizzled_sf_to_linear(scale_swizzled, rows, num_groups)
+    return mxfp4_scale_uint8_to_float(u8)
+
+
 def dequant_mxfp4(
     fp4_packed: torch.Tensor,
     scale_swizzled: torch.Tensor,

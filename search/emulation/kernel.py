@@ -77,6 +77,7 @@ class EmulationKernel:
             stage3_rounding=self.stage3_rounding,
             stage4_rounding=self.stage4_rounding,
             m_chunk_size=self.m_chunk_size,
+            group_size=16,
         )
         return result.to(out_dtype)
 

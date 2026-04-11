@@ -38,6 +38,7 @@ class NVFPQuantState:
     w_stage3: int
     w_stage4: int
     w_reduce: int
+    group_size: int
     m_chunk_size: int
     stage3_rounding: int
     stage4_rounding: int
@@ -79,6 +80,7 @@ def build_nvfp_fns(
             w_stage3=w_stage3,
             w_stage4=w_stage4,
             w_reduce=4,
+            group_size=16,
             m_chunk_size=m_chunk_size,
             stage3_rounding=stage3_rounding,
             stage4_rounding=stage4_rounding,

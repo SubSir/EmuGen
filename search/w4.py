@@ -4,11 +4,12 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_REPO_ROOT))
+sys.path.insert(0, str(_REPO_ROOT / "mxfp_cpp_emul"))
 
 from gemm_compare.data import DataGenerator
 from search.emulation import (
-    SearchNVFPEmulationState,
     emulate_nvfp_scaled_fp4_mm,
     nvfp_unpack_fp4_to_fp16,
     nvfp_swizzled_block_scale_to_linear,
@@ -16,6 +17,8 @@ from search.emulation import (
 
 import torch
 from gemm_compare.backends import build_gemm_compare_fns
+from gemm_compare.backends.mxfp import mxfp_state_as_nvfp_emulation
+from mxfp import mxfp_swizzled_scale_to_linear_fp32, unpack_mxfp4_to_fp16
 
 parser = argparse.ArgumentParser(description="Search w (backend-agnostic quant + real GEMM).")
 parser.add_argument(
@@ -24,34 +27,7 @@ parser.add_argument(
     choices=("mxfp", "nvfp"),
     help="mxfp: flashinfer mm_fp4; nvfp: Cutlass scaled fp4",
 )
-parser.add_argument(
-    "--seed",
-    type=int,
-    default=None,
-    help="RNG seed (default: time/urandom, same style as gemm_compare.runner)",
-)
 args = parser.parse_args()
-
-DISTRIBUTIONS = [
-    "normal",
-    "uniform",
-    "large",
-    "outliers",
-    "mixed_rows",
-    "abs_large",
-]
-
-SHAPE = (1024, 64)
-DEVICE = "cuda"
-
-seed = args.seed
-if seed is None:
-    seed = int(time.time() * 1e6) ^ int.from_bytes(__import__("os").urandom(8), "little")
-random.seed(seed)
-torch.manual_seed(seed)
-if DEVICE == "cuda" and torch.cuda.is_available():
-    torch.cuda.manual_seed_all(seed)
-print("seed =", seed)
 
 GROUP_SIZE = 32 if args.backend == "mxfp" else 16
 ab_dtype = torch.float16
@@ -94,11 +70,18 @@ while True:
   next_survivors = []
   for w3 in survivors:
     state.w_stage3 = w3
-    out = emulate_nvfp_scaled_fp4_mm(
-      state,
-      unpack_fp4=nvfp_unpack_fp4_to_fp16,
-      linearize_block_scales=nvfp_swizzled_block_scale_to_linear,
-    )
+    if args.backend == "nvfp":
+      out = emulate_nvfp_scaled_fp4_mm(
+        state,
+        unpack_fp4=nvfp_unpack_fp4_to_fp16,
+        linearize_block_scales=nvfp_swizzled_block_scale_to_linear,
+      )
+    else:
+      out = emulate_nvfp_scaled_fp4_mm(
+        mxfp_state_as_nvfp_emulation(state),
+        unpack_fp4=unpack_mxfp4_to_fp16,
+        linearize_block_scales=mxfp_swizzled_scale_to_linear_fp32,
+      )
     if emu_matches_real(real_out, out):
       next_survivors.append(w3)
   survivors = next_survivors
