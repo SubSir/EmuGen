@@ -31,11 +31,7 @@ From the repository root, ensure the root is on `PYTHONPATH` (or install the tre
 from gemm_compare.backends.nvfp import build_nvfp_fns
 from gemm_compare import run_suite
 
-quant_fn, real_fn, emul_fn, meta = build_nvfp_fns(
-    out_dtype=torch.float16,
-    w_stage3=25,
-    w_stage4=25,
-)
+quant_fn, real_fn, emul_fn, meta = build_nvfp_fns(out_dtype=torch.float16)
 
 exit_code = run_suite(
     quant_fn,
@@ -55,7 +51,7 @@ For MXFP, use `torch.bfloat16` inputs and `build_mxfp_fns()` (FlashInfer + dequa
 
 ```bash
 # NVFP: nvfp.ops (Cutlass) vs nvfp_cpp_emul (JIT C++ extension)
-PYTHONPATH=. python -m gemm_compare nvfp -n 50 --w-stage3 25 --w-stage4 25
+PYTHONPATH=. python -m gemm_compare nvfp -n 50
 
 # MXFP: flashinfer.gemm.mm_fp4 vs dequantized BF16 matmul (see mxfp_cpp_emul/mxfp.py)
 PYTHONPATH=. python -m gemm_compare mxfp -n 20 --mxfp-backend cudnn --group-size 32
