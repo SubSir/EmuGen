@@ -35,8 +35,6 @@ class NVFPQuantState:
     scale_b: torch.Tensor
     alpha: torch.Tensor
     out_dtype: torch.dtype
-    w_stage3: int
-    w_stage4: int
     w_reduce: int
     group_size: int
     m_chunk_size: int
@@ -47,8 +45,6 @@ class NVFPQuantState:
 def build_nvfp_fns(
     *,
     out_dtype: torch.dtype = torch.float16,
-    w_stage3: int = 25,
-    w_stage4: int = 25,
     m_chunk_size: int = 128,
     stage3_rounding: int | None = None,
     stage4_rounding: int | None = None,
@@ -77,8 +73,6 @@ def build_nvfp_fns(
             scale_b=scale_b,
             alpha=alpha,
             out_dtype=out_dtype,
-            w_stage3=w_stage3,
-            w_stage4=w_stage4,
             w_reduce=4,
             group_size=16,
             m_chunk_size=m_chunk_size,
@@ -103,8 +97,6 @@ def build_nvfp_fns(
             state.scale_a,
             state.scale_b,
             state.alpha,
-            w_stage3=state.w_stage3,
-            w_stage4=state.w_stage4,
             m_chunk_size=state.m_chunk_size,
             stage3_rounding=state.stage3_rounding,
             stage4_rounding=state.stage4_rounding,
@@ -113,7 +105,5 @@ def build_nvfp_fns(
     meta: dict[str, Any] = {
         "backend": "nvfp",
         "out_dtype": str(out_dtype),
-        "w_stage3": w_stage3,
-        "w_stage4": w_stage4,
     }
     return quant_fn, real_fn, emul_fn, meta

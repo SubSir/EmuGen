@@ -24,8 +24,6 @@ def main() -> int:
     parser.add_argument("-n", "--iterations", type=int, default=100)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--w-stage3", type=int, default=25, help="NVFP emul only")
-    parser.add_argument("--w-stage4", type=int, default=25, help="NVFP emul only")
     parser.add_argument("--nvfp-out", choices=("float16", "bfloat16"), default="float16")
     parser.add_argument("--mxfp-backend", default="cudnn", help="flashinfer mm_fp4 backend")
     parser.add_argument("--group-size", type=int, default=32, help="MXFP block size")
@@ -41,11 +39,7 @@ def main() -> int:
         from gemm_compare.backends.nvfp import build_nvfp_fns
 
         out_dtype = torch.float16 if args.nvfp_out == "float16" else torch.bfloat16
-        quant_fn, real_fn, emul_fn, meta = build_nvfp_fns(
-            out_dtype=out_dtype,
-            w_stage3=args.w_stage3,
-            w_stage4=args.w_stage4,
-        )
+        quant_fn, real_fn, emul_fn, meta = build_nvfp_fns(out_dtype=out_dtype)
         name = f"NVFP | {meta}"
         dtype = torch.float16
     else:

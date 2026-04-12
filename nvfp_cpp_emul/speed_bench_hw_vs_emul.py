@@ -96,8 +96,6 @@ def main() -> None:
             scale_a,
             scale_b,
             alpha,
-            w_stage3=25,
-            w_stage4=25,
             m_chunk_size=args.m_chunk_size,
             stage3_rounding=RZ,
             stage4_rounding=RZ,

@@ -10,9 +10,9 @@ Optional compile flags before first use::
   import nvfp_cpp_emul
   nvfp_cpp_emul.JIT_EXTRA_CFLAGS.append("-O3")
 
-Same logical pipeline as nvfp_kernel/verify_acc_modeling.py + emulation/core.py:
-  unpack FP4 -> FP16 group dots -> apply block scales -> W-bit 4:1 reduction per K64
-  -> inter-block FP32 accumulate -> multiply alpha -> FP16.
+Same logical pipeline as nvfp_kernel/verify_acc_modeling.py:
+  unpack FP4 -> FP16 group dots -> apply block scales -> fp64 sum per K64 groups
+  -> optional RZ/RNE to fp32 -> multiply alpha -> FP16.
 
 If ``nvfp.ops`` is importable (your CUDA nvfp stack), this script also compares against
 ``cutlass_scaled_fp4_mm`` like the original verifier.
@@ -74,8 +74,6 @@ def main() -> None:
         scale_a,
         scale_b,
         alpha,
-        w_stage3=25,
-        w_stage4=25,
         m_chunk_size=128,
         stage3_rounding=RZ,
         stage4_rounding=RZ,

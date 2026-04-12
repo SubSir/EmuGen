@@ -13,7 +13,7 @@ from typing import Any, Callable
 
 _MXFP_KW = frozenset({"group_size", "out_dtype", "mm_backend"})
 _NVFP_KW = frozenset(
-    {"out_dtype", "w_stage3", "w_stage4", "m_chunk_size", "stage3_rounding", "stage4_rounding"}
+    {"out_dtype", "m_chunk_size", "stage3_rounding", "stage4_rounding"}
 )
 
 

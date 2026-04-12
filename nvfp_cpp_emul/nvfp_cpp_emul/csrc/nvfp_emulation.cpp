@@ -1,7 +1,6 @@
-// NVFP4 scaled GEMM accuracy emulation using libtorch (matches nvfp_kernel/emulation/core.py).
+// NVFP4 scaled GEMM accuracy emulation using libtorch (fp16 tile MMA, fp64 reduction, fp32 rounding).
 #include <torch/extension.h>
 #include <vector>
-#include <cmath>
 
 namespace {
 
@@ -52,40 +51,26 @@ torch::Tensor to_float32_with_rounding(const torch::Tensor& tensor_f64, int roun
 
 torch::Tensor hardware_reduction_4to1(
     const std::vector<torch::Tensor>& v_list,
-    int64_t W,
     bool output_fp32,
     int rounding) {
-  auto stacked = torch::stack(v_list, 0);
-  auto max_val = std::get<0>(stacked.abs().max(0));
-  auto max_exp = std::get<1>(torch::frexp(max_val));
-  auto w0 = torch::scalar_tensor(
-      static_cast<double>(W), max_val.options().dtype(torch::kFloat64));
-  auto scale = torch::exp2(w0 - max_exp.to(torch::kFloat64));
-
-  torch::Tensor v_aligned_sum = torch::zeros_like(v_list[0], torch::dtype(torch::kFloat64));
+  torch::Tensor v_aligned_sum =
+      torch::zeros_like(v_list[0], torch::dtype(torch::kFloat64));
   for (const auto& v : v_list) {
-    v_aligned_sum = v_aligned_sum + torch::trunc(v.to(torch::kFloat64) * scale);
+    v_aligned_sum = v_aligned_sum + v.to(torch::kFloat64);
   }
-  auto summed_f64 = v_aligned_sum / scale;
+  auto summed_f64 = v_aligned_sum;
   if (output_fp32) {
     return to_float32_with_rounding(summed_f64, rounding);
   }
   return summed_f64;
 }
 
+// Same call pattern as before fixed-point modeling; scale / trunc / rescale removed.
 torch::Tensor hardware_add_wbits(
     const torch::Tensor& acc_fp32,
     const torch::Tensor& new_val_wbits,
-    int64_t W,
     int rounding) {
-  auto acc_exp = std::get<1>(torch::frexp(acc_fp32.abs()));
-  auto w0 = torch::scalar_tensor(
-      static_cast<double>(W), acc_fp32.options().dtype(torch::kFloat64));
-  auto scale = torch::exp2(w0 - acc_exp.to(torch::kFloat64));
-  auto acc_aligned = acc_fp32.to(torch::kFloat64) * scale;
-  auto new_val_aligned = torch::trunc(new_val_wbits.to(torch::kFloat64) * scale);
-  auto sum_fixed = acc_aligned + new_val_aligned;
-  auto sum_f64 = sum_fixed / scale;
+  auto sum_f64 = acc_fp32.to(torch::kFloat64) + new_val_wbits.to(torch::kFloat64);
   return to_float32_with_rounding(sum_f64, rounding);
 }
 
@@ -108,8 +93,6 @@ torch::Tensor emulated_scaled_fp4_mm(
     const torch::Tensor& scale_a,
     const torch::Tensor& scale_b,
     const torch::Tensor& alpha,
-    int64_t w_stage3,
-    int64_t w_stage4,
     int64_t m_chunk_size,
     int stage3_rounding,
     int stage4_rounding) {
@@ -148,10 +131,10 @@ torch::Tensor emulated_scaled_fp4_mm(
     torch::Tensor summed_groups;
     if (num_4_groups == 1) {
       summed_groups = hardware_reduction_4to1(
-          v_list, w_stage3, /*output_fp32=*/true, stage3_rounding);
+          v_list, /*output_fp32=*/true, stage3_rounding);
     } else {
       summed_groups = hardware_reduction_4to1(
-          v_list, w_stage3, /*output_fp32=*/false, stage3_rounding);
+          v_list, /*output_fp32=*/false, stage3_rounding);
     }
 
     torch::Tensor summed_chunk;
@@ -160,8 +143,7 @@ torch::Tensor emulated_scaled_fp4_mm(
     } else {
       auto acc = to_float32_with_rounding(summed_groups.select(-1, 0), stage4_rounding);
       for (int64_t i = 1; i < num_4_groups; ++i) {
-        acc = hardware_add_wbits(
-            acc, summed_groups.select(-1, i), w_stage4, stage4_rounding);
+        acc = hardware_add_wbits(acc, summed_groups.select(-1, i), stage4_rounding);
       }
       summed_chunk = acc;
     }
@@ -177,14 +159,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def(
       "emulated_scaled_fp4_mm",
       &emulated_scaled_fp4_mm,
-      "NVFP4 scaled GEMM emulation (libtorch, matches core MMAEngine.emulation_scaled_fp4_mm)",
+      "NVFP4 scaled GEMM emulation (libtorch)",
       pybind11::arg("a_fp4"),
       pybind11::arg("b_fp4"),
       pybind11::arg("scale_a"),
       pybind11::arg("scale_b"),
       pybind11::arg("alpha"),
-      pybind11::arg("w_stage3") = 25,
-      pybind11::arg("w_stage4") = 25,
       pybind11::arg("m_chunk_size") = 128,
       pybind11::arg("stage3_rounding") = 0,
       pybind11::arg("stage4_rounding") = 0);
