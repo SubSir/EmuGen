@@ -129,7 +129,7 @@ def run_suite(
         "mixed_rows",
         "abs_large",
     ]
-    dims_m = dims_m or [128, 256, 1024, 2048]
+    dims_m = dims_m or [128, 256, 1024, 2048, 4096]
     dims_n = dims_n or [128, 256, 1024, 2048, 4096]
     dims_k = dims_k or [128, 256, 512, 1024]
 
