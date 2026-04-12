@@ -29,34 +29,17 @@ class HardwareCore:
 
     @staticmethod
     def hardware_add_wbits(acc_fp32, new_val_wbits, W=25, rounding=RoundStrategy.RZ):
-        """Stage 4: FP32 accumulator + W-bit lane value -> FP32."""
-        _, acc_exp = torch.frexp(acc_fp32.abs())
-        scale = 2.0 ** (W - acc_exp)
-        acc_aligned = acc_fp32.double() * scale
-        new_val_aligned = torch.trunc(new_val_wbits.double() * scale)
-        sum_fixed = acc_aligned + new_val_aligned
-        sum_f64 = sum_fixed / scale
+        """Stage 4: FP32 accumulator + lane value -> FP32 (``W`` retained for API compatibility; unused)."""
+        sum_f64 = acc_fp32.double() + new_val_wbits.double()
         return HardwareCore.to_float32_with_rounding(sum_f64, rounding)
 
     @staticmethod
     def hardware_reduction_nto1(v_list, W=25, output_fp32=True, rounding=RoundStrategy.RZ):
-        """
-        Stage 3: n-to-1 reduction (n = len(v_list), typically w_reduce).
-
-        1. Max exponent across lanes
-        2. Align and truncate each lane (RZ)
-        3. Sum in fixed-point; optional FP32 output with rounding
-        """
-        stacked = torch.stack(v_list, dim=0)
-        max_val = torch.max(stacked.abs(), dim=0)[0]
-        _, max_exp = torch.frexp(max_val)
-        scale = 2.0 ** (W - max_exp)
+        """Stage 3: n-to-1 reduction — fp64 sum per lane (``W`` retained for API compatibility; unused)."""
         v_aligned_sum = torch.zeros_like(v_list[0], dtype=torch.float64)
         for v in v_list:
-            mul_val = v.double() * scale
-            truncated = torch.trunc(mul_val)
-            v_aligned_sum += truncated
-        summed_f64 = v_aligned_sum / scale
+            v_aligned_sum += v.double()
+        summed_f64 = v_aligned_sum
         if output_fp32:
             return HardwareCore.to_float32_with_rounding(summed_f64, rounding)
         return summed_f64

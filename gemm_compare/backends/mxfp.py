@@ -1,7 +1,10 @@
 """
-MXFP4: ``flashinfer.gemm.mm_fp4`` (real) vs Python MMA emulation (same path as NVFP, with MXFP unpack + scales).
+MXFP4: ``flashinfer.gemm.mm_fp4`` (real) vs Python ``MMAEngine`` via ``emulate_nvfp_scaled_fp4_mm``.
 
-The ``mxfp_cpp_emul`` directory is added to ``sys.path`` so the ``mxfp`` helper module can be imported.
+The ``mxfp_cpp_emul`` directory is on ``sys.path`` for ``mxfp`` helpers (unpack / scale linearize).
+
+Bitwise ``real == emul`` is sensitive to ``out_dtype`` and to the dtype of ``A,B`` passed to
+``mxfp4_quantize`` (``search/w3.py`` uses float16 for both; use the same in ``gemm_compare/cli.py``).
 """
 from __future__ import annotations
 
@@ -14,6 +17,8 @@ import torch
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _MXFP_PKG_DIR = _REPO_ROOT / "mxfp_cpp_emul"
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 if str(_MXFP_PKG_DIR) not in sys.path:
     sys.path.insert(0, str(_MXFP_PKG_DIR))
 
@@ -61,7 +66,7 @@ def mxfp_state_as_nvfp_emulation(state: MXFPQuantState):
 def build_mxfp_fns(
     *,
     group_size: int = 32,
-    out_dtype: torch.dtype = torch.bfloat16,
+    out_dtype: torch.dtype = torch.float16,
     mm_backend: str = "cudnn",
     w_stage3: int = 25,
     w_stage4: int = 25,
@@ -70,12 +75,14 @@ def build_mxfp_fns(
     stage4_rounding: int | None = None,
 ):
     from mxfp_cpp_emul import RZ
-    from mxfp import mxfp_swizzled_scale_to_linear_fp32, unpack_mxfp4_to_fp16
 
     if stage3_rounding is None:
         stage3_rounding = RZ
     if stage4_rounding is None:
         stage4_rounding = RZ
+
+    from mxfp import mxfp_swizzled_scale_to_linear_fp32, unpack_mxfp4_to_fp16
+    from search.emulation import emulate_nvfp_scaled_fp4_mm
 
     import flashinfer
 
@@ -115,11 +122,8 @@ def build_mxfp_fns(
         )
 
     def emul_fn(state: MXFPQuantState) -> torch.Tensor:
-        from search.emulation.gemm import emulate_nvfp_scaled_fp4_mm
-
-        nv = mxfp_state_as_nvfp_emulation(state)
         return emulate_nvfp_scaled_fp4_mm(
-            nv,
+            mxfp_state_as_nvfp_emulation(state),
             unpack_fp4=unpack_mxfp4_to_fp16,
             linearize_block_scales=mxfp_swizzled_scale_to_linear_fp32,
         )

@@ -26,6 +26,12 @@ def main() -> int:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--nvfp-out", choices=("float16", "bfloat16"), default="float16")
     parser.add_argument("--mxfp-backend", default="cudnn", help="flashinfer mm_fp4 backend")
+    parser.add_argument(
+        "--mxfp-out",
+        choices=("float16", "bfloat16"),
+        default="float16",
+        help="MXFP output dtype and random A/B dtype (float16 matches search/w3.py defaults)",
+    )
     parser.add_argument("--group-size", type=int, default=32, help="MXFP block size")
     args = parser.parse_args()
 
@@ -45,13 +51,14 @@ def main() -> int:
     else:
         from gemm_compare.backends.mxfp import build_mxfp_fns
 
+        mxfp_out = torch.float16 if args.mxfp_out == "float16" else torch.bfloat16
         quant_fn, real_fn, emul_fn, meta = build_mxfp_fns(
             group_size=args.group_size,
-            out_dtype=torch.bfloat16,
+            out_dtype=mxfp_out,
             mm_backend=args.mxfp_backend,
         )
         name = f"MXFP | {meta}"
-        dtype = torch.bfloat16
+        dtype = mxfp_out
 
     return run_suite(
         quant_fn,
