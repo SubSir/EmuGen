@@ -16,10 +16,12 @@ The runner generates `A ∈ ℝ^{M×K}` and `B ∈ ℝ^{N×K}` with configurable
 
 | Path | Purpose |
 |------|---------|
-| `gemm_compare/runner.py` | `compare_tensors`, `run_test_case`, `run_suite` |
+| `gemm_compare/runner.py` | `compare_tensors`, `run_test_case`, `run_suite`, `run_suite_export`, `run_suite_import` |
 | `gemm_compare/data.py` | `DataGenerator`, `DataGenerator_Abs` (random tensor distributions) |
-| `gemm_compare/backends/nvfp.py` | NVFP4: `build_nvfp_fns()` |
-| `gemm_compare/backends/mxfp.py` | MXFP4: `build_mxfp_fns()` |
+| `gemm_compare/rollout.py` | Save/load rollout `.pt` (quantized state + real output per case) |
+| `gemm_compare/hf_hub_rollout.py` | Optional upload/download of rollout files on the Hugging Face Hub |
+| `gemm_compare/backends/nvfp.py` | NVFP4: `build_nvfp_fns()`, `build_nvfp_emul_fn()`, state (de)serialization for rollout |
+| `gemm_compare/backends/mxfp.py` | MXFP4: `build_mxfp_fns()`, `build_mxfp_emul_fn()`, state (de)serialization for rollout |
 | `gemm_compare/cli.py` | Command-line entry for NVFP / MXFP suites |
 | `gemm_compare/examples/toy_cpu.py` | Minimal three-function example (CPU, no extra deps beyond PyTorch) |
 
@@ -59,6 +61,51 @@ PYTHONPATH=. python -m gemm_compare mxfp -n 20 --mxfp-backend cudnn --group-size
 
 Options include `--seed`, `--iterations` / `-n`, NVFP `--nvfp-out float16|bfloat16`, and MXFP `--mxfp-backend`, `--group-size`.
 
+### Cross-machine rollout and Hugging Face Hub
+
+By default the CLI uses **`--mode local`**: each case quantizes on this machine, runs **real** and **emul**, and compares them in one process.
+
+For **split hardware** (e.g. real GEMM on one GPU box, emulation on another), use rollout artifacts:
+
+| `--mode` | Role |
+|----------|------|
+| **`local`** | Same as before: `quant_fn` → `real_fn` and `emul_fn` on this machine. |
+| **`export`** | On the machine with the real stack: same random suite as `local`, but each case saves **quantized state** (CPU tensors) and the **real output** into a local `.pt` file (`--artifact`). Emulation is skipped unless you pass **`--export-verify-local`** (slower sanity check). |
+| **`import`** | On another machine: load that `.pt`, run **emulation only**, and compare against the **saved real outputs** bit-for-bit. |
+
+**Export** always needs a local **`--artifact`** path (the file is written there). **Import** needs either **`--artifact`** (local file) or **`--hf-repo`** (download from the Hub; see below).
+
+**Import-side dependencies (lighter than export):**
+
+- **MXFP:** `build_mxfp_emul_fn()` — no FlashInfer; still needs `mxfp_cpp_emul`, `search.emulation`, and CUDA in typical setups.
+- **NVFP:** `build_nvfp_emul_fn()` — no `nvfp.ops` / Cutlass; still needs `nvfp_cpp_emul` and CUDA for the C++ emulation path.
+
+**Hugging Face Hub (optional):** install `huggingface_hub`, then you can push after export or pull on import without copying files by hand.
+
+| Flag | Meaning |
+|------|---------|
+| `--hf-repo REPO_ID` | Hub repo id, e.g. `username/gemm-rollouts`. With **export**: upload after the local file is saved. With **import**: download this repo’s file (omit `--artifact`). |
+| `--hf-path` | Path inside the repo (default: `gemm_compare_rollout.pt`). |
+| `--hf-repo-type` | `model` (default) or `dataset`. |
+| `--hf-revision` | Branch, tag, or commit. |
+| `--hf-token` | API token; if omitted, `HF_TOKEN` or the cached `huggingface-cli` login is used. |
+| `--hf-create-repo` | With export + `--hf-repo`: create the repo if it does not exist. |
+| `--hf-private` | With `--hf-create-repo`: create a **private** repo. |
+
+Examples:
+
+```bash
+# Machine A: write rollout locally, then push to the Hub
+PYTHONPATH=. python -m gemm_compare mxfp --mode export --artifact ./mxfp_rollout.pt -n 1000 --seed 1 \
+  --hf-repo YOUR_USER/gemm-rollouts --hf-path rollouts/mxfp_n1000.pt --hf-create-repo
+
+# Machine B: import from the Hub (no local --artifact)
+PYTHONPATH=. python -m gemm_compare mxfp --mode import \
+  --hf-repo YOUR_USER/gemm-rollouts --hf-path rollouts/mxfp_n1000.pt
+```
+
+If both `--artifact` and `--hf-repo` are given for **import**, the **local `--artifact`** is used.
+
 ### Backends
 
 **NVFP (`gemm_compare/backends/nvfp.py`)**  
@@ -81,4 +128,5 @@ Options include `--seed`, `--iterations` / `-n`, NVFP `--nvfp-out float16|bfloat
 
 - **Toy example:** PyTorch only.  
 - **NVFP backend:** CUDA, `nvfp` stack, and a successful JIT compile of `nvfp_cpp_emul`.  
-- **MXFP backend:** CUDA, `flashinfer`, and compatible `mm_fp4` backend (e.g. cuDNN).
+- **MXFP backend:** CUDA, `flashinfer`, and compatible `mm_fp4` backend (e.g. cuDNN).  
+- **Rollout Hub push/pull:** `pip install huggingface_hub` and a token or login with write access to the target repo when uploading.
