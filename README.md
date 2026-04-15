@@ -114,10 +114,9 @@ PYTHONPATH=. python -m gemm_compare mxfp --mode import \
   --hf-repo YOUR_USER/gemm-rollouts --hf-path rollouts/mxfp_n1000.pt \
   --import-compare pseudo
 
-# NVFP pseudo import also works, but export must include inputs:
-# add --export-include-inputs on Machine A export, then run:
+# NVFP pseudo import from Hub:
 # PYTHONPATH=. python -m gemm_compare nvfp --mode import \
-#   --hf-repo YOUR_USER/gemm-rollouts --hf-path rollouts/nvfp_with_inputs.pt \
+#   --hf-repo YOUR_USER/gemm-rollouts --hf-path rollouts/nvfp_n1000.pt \
 #   --import-compare pseudo
 ```
 

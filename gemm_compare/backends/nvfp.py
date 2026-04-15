@@ -33,6 +33,8 @@ class NVFPQuantState:
     b_fp4: torch.Tensor
     scale_a: torch.Tensor
     scale_b: torch.Tensor
+    global_scale_a: torch.Tensor
+    global_scale_b: torch.Tensor
     alpha: torch.Tensor
     out_dtype: torch.dtype
     w_reduce: int
@@ -40,8 +42,6 @@ class NVFPQuantState:
     m_chunk_size: int
     stage3_rounding: int
     stage4_rounding: int
-    a: torch.Tensor | None = None
-    b: torch.Tensor | None = None
 
 
 def _dtype_to_str(dt: torch.dtype) -> str:
@@ -62,6 +62,8 @@ def nvfp_quant_state_to_cpu_dict(state: NVFPQuantState, *, include_inputs: bool 
         "b_fp4": state.b_fp4.detach().cpu().contiguous(),
         "scale_a": state.scale_a.detach().cpu().contiguous(),
         "scale_b": state.scale_b.detach().cpu().contiguous(),
+        "global_scale_a": state.global_scale_a.detach().cpu().contiguous(),
+        "global_scale_b": state.global_scale_b.detach().cpu().contiguous(),
         "alpha": state.alpha.detach().cpu().contiguous(),
         "out_dtype": _dtype_to_str(state.out_dtype),
         "w_reduce": int(state.w_reduce),
@@ -70,9 +72,6 @@ def nvfp_quant_state_to_cpu_dict(state: NVFPQuantState, *, include_inputs: bool 
         "stage3_rounding": int(state.stage3_rounding),
         "stage4_rounding": int(state.stage4_rounding),
     }
-    if include_inputs and state.a is not None and state.b is not None:
-        out["a"] = state.a.detach().cpu().contiguous()
-        out["b"] = state.b.detach().cpu().contiguous()
     return out
 
 
@@ -84,6 +83,8 @@ def nvfp_quant_state_from_dict(d: dict[str, Any], *, device: str | torch.device)
         b_fp4=d["b_fp4"].to(device),
         scale_a=d["scale_a"].to(device),
         scale_b=d["scale_b"].to(device),
+        global_scale_a=d["global_scale_a"].to(device),
+        global_scale_b=d["global_scale_b"].to(device),
         alpha=d["alpha"].to(device),
         out_dtype=_dtype_from_str(d["out_dtype"]),
         w_reduce=int(d["w_reduce"]),
@@ -91,8 +92,6 @@ def nvfp_quant_state_from_dict(d: dict[str, Any], *, device: str | torch.device)
         m_chunk_size=int(d["m_chunk_size"]),
         stage3_rounding=int(d["stage3_rounding"]),
         stage4_rounding=int(d["stage4_rounding"]),
-        a=d["a"].to(device) if "a" in d else None,
-        b=d["b"].to(device) if "b" in d else None,
     )
 
 
@@ -135,12 +134,13 @@ def build_nvfp_pseudo_fn():
     import nvfp.pseudo_quant as pseudo_quant
 
     def pseudo_fn(state: NVFPQuantState) -> torch.Tensor:
-        if state.a is None or state.b is None:
-            raise ValueError(
-                "NVFP pseudo import requires rollout with saved inputs. "
-                "Re-export using --mode export --export-include-inputs."
-            )
-        return pseudo_quant.nvfp4_pseudo_quantize(state.a) @ pseudo_quant.nvfp4_pseudo_quantize(state.b).T
+        a = pseudo_quant.dequantize_to_dtype(
+            state.a_fp4.view(torch.float4_e2m1fn_x2), state.scale_a, state.global_scale_a
+        ).to(state.out_dtype)
+        b = pseudo_quant.dequantize_to_dtype(
+            state.b_fp4.view(torch.float4_e2m1fn_x2), state.scale_b, state.global_scale_b
+        ).to(state.out_dtype)
+        return a @ b.T
 
     meta: dict[str, Any] = {"backend": "nvfp", "pseudo_only": True}
     return pseudo_fn, meta
@@ -180,12 +180,12 @@ def build_nvfp_fns(
         a_fp4 = a_fp4.contiguous().view(torch.uint8)
         b_fp4 = b_fp4.contiguous().view(torch.uint8)
         return NVFPQuantState(
-            a=a,
-            b=b,
             a_fp4=a_fp4,
             b_fp4=b_fp4,
             scale_a=scale_a,
             scale_b=scale_b,
+            global_scale_a=a_gs,
+            global_scale_b=b_gs,
             alpha=alpha,
             out_dtype=out_dtype,
             w_reduce=4,
@@ -196,9 +196,9 @@ def build_nvfp_fns(
         )
 
     def pseudo_fn(state: NVFPQuantState) -> torch.Tensor:
-        out = pseudo_quant.nvfp4_pseudo_quantize(
-            state.a) @ pseudo_quant.nvfp4_pseudo_quantize(
-            state.b).T
+        a = pseudo_quant.dequantize_to_dtype(state.a_fp4.view(torch.float4_e2m1fn_x2), state.scale_a, state.global_scale_a).to(state.out_dtype)
+        b = pseudo_quant.dequantize_to_dtype(state.b_fp4.view(torch.float4_e2m1fn_x2), state.scale_b, state.global_scale_b).to(state.out_dtype)
+        out = a @ b.T
         return out
 
     def real_fn(state: NVFPQuantState) -> torch.Tensor:

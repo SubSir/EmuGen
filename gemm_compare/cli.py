@@ -65,7 +65,7 @@ def main() -> int:
     parser.add_argument(
         "--export-include-inputs",
         action="store_true",
-        help="During export, include original A/B inputs in rollout state (needed for NVFP pseudo comparison on import).",
+        help="During export, include original A/B inputs in rollout state (optional, for custom analyses).",
     )
     parser.add_argument(
         "--import-compare",
