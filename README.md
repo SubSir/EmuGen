@@ -55,11 +55,17 @@ For MXFP, use `torch.bfloat16` inputs and `build_mxfp_fns()` (FlashInfer + dequa
 # NVFP: nvfp.ops (Cutlass) vs nvfp_cpp_emul (JIT C++ extension)
 PYTHONPATH=. python -m gemm_compare nvfp -n 50
 
+# NVFP pseudo vs real: pseudo_quant matmul vs Cutlass, summary metric only
+PYTHONPATH=. python -m gemm_compare nvfp -n 50 --nvfp-compare pseudo-real
+
 # MXFP: flashinfer.gemm.mm_fp4 vs dequantized BF16 matmul (see mxfp_cpp_emul/mxfp.py)
 PYTHONPATH=. python -m gemm_compare mxfp -n 20 --mxfp-backend cudnn --group-size 32
+
+# MXFP pseudo vs real: dequantized matmul vs flashinfer mm_fp4, summary metric only
+PYTHONPATH=. python -m gemm_compare mxfp -n 20 --mxfp-backend cudnn --group-size 32 --mxfp-compare pseudo-real
 ```
 
-Options include `--seed`, `--iterations` / `-n`, NVFP `--nvfp-out float16|bfloat16`, and MXFP `--mxfp-backend`, `--group-size`.
+Options include `--seed`, `--iterations` / `-n`, NVFP `--nvfp-out float16|bfloat16` and `--nvfp-compare real-emul|pseudo-real`, plus MXFP `--mxfp-backend`, `--group-size`, and `--mxfp-compare real-emul|pseudo-real`.
 
 ### Cross-machine rollout and Hugging Face Hub
 
@@ -102,9 +108,22 @@ PYTHONPATH=. python -m gemm_compare mxfp --mode export --artifact ./mxfp_rollout
 # Machine B: import from the Hub (no local --artifact)
 PYTHONPATH=. python -m gemm_compare mxfp --mode import \
   --hf-repo YOUR_USER/gemm-rollouts --hf-path rollouts/mxfp_n1000.pt
+
+# Machine B: import from the Hub and compare pseudo vs saved real output
+PYTHONPATH=. python -m gemm_compare mxfp --mode import \
+  --hf-repo YOUR_USER/gemm-rollouts --hf-path rollouts/mxfp_n1000.pt \
+  --import-compare pseudo
+
+# NVFP pseudo import also works, but export must include inputs:
+# add --export-include-inputs on Machine A export, then run:
+# PYTHONPATH=. python -m gemm_compare nvfp --mode import \
+#   --hf-repo YOUR_USER/gemm-rollouts --hf-path rollouts/nvfp_with_inputs.pt \
+#   --import-compare pseudo
 ```
 
 If both `--artifact` and `--hf-repo` are given for **import**, the **local `--artifact`** is used.
+
+`pseudo-real` compare mode is for `--mode local` runs (it compares pseudo vs real directly on one machine).
 
 ### Backends
 

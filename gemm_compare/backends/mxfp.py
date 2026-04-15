@@ -152,6 +152,18 @@ def build_mxfp_emul_fn(
     return emul_fn, meta
 
 
+def build_mxfp_pseudo_fn():
+    import flashinfer
+
+    def pseudo_fn(state: MXFPQuantState) -> torch.Tensor:
+        return flashinfer.mxfp4_dequantize(state.a_fp4, state.a_scale) @ flashinfer.mxfp4_dequantize(
+            state.b_fp4, state.b_scale
+        ).T
+
+    meta: dict[str, Any] = {"backend": "mxfp", "pseudo_only": True}
+    return pseudo_fn, meta
+
+
 def build_mxfp_fns(
     *,
     group_size: int = 32,
@@ -162,6 +174,7 @@ def build_mxfp_fns(
     m_chunk_size: int = 128,
     stage3_rounding: int | None = None,
     stage4_rounding: int | None = None,
+    return_pseudo: bool = False,
 ):
     from mxfp_cpp_emul import RZ
 
@@ -202,6 +215,10 @@ def build_mxfp_fns(
             stage3_rounding=stage3_rounding,
             stage4_rounding=stage4_rounding,
         )
+    
+    def pseudo_fn(state: MXFPQuantState) -> torch.Tensor:
+        out = flashinfer.mxfp4_dequantize(state.a_fp4, state.a_scale) @ flashinfer.mxfp4_dequantize(state.b_fp4, state.b_scale).T
+        return out.cuda()
 
     def real_fn(state: MXFPQuantState) -> torch.Tensor:
         import flashinfer
@@ -223,4 +240,6 @@ def build_mxfp_fns(
         "out_dtype": str(out_dtype),
         "mm_backend": mm_backend,
     }
+    if return_pseudo:
+        return quant_fn, real_fn, emul_fn, pseudo_fn, meta
     return quant_fn, real_fn, emul_fn, meta

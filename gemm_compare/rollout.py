@@ -19,12 +19,12 @@ def _torch_load(path: str | Path, *, map_location: str | torch.device | None = N
         return torch.load(path, **kwargs)
 
 
-def quant_state_to_cpu_dict(state: Any, backend: str) -> dict[str, Any]:
+def quant_state_to_cpu_dict(state: Any, backend: str, *, include_inputs: bool = False) -> dict[str, Any]:
     b = backend.lower()
     if b == "nvfp":
         from gemm_compare.backends.nvfp import nvfp_quant_state_to_cpu_dict
 
-        return nvfp_quant_state_to_cpu_dict(state)
+        return nvfp_quant_state_to_cpu_dict(state, include_inputs=include_inputs)
     if b == "mxfp":
         from gemm_compare.backends.mxfp import mxfp_quant_state_to_cpu_dict
 

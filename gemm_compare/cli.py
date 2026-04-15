@@ -25,12 +25,24 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--nvfp-out", choices=("float16", "bfloat16"), default="float16")
+    parser.add_argument(
+        "--nvfp-compare",
+        choices=("real-emul", "pseudo-real"),
+        default="real-emul",
+        help="NVFP compare mode: real-emul (default) or pseudo-real (summary MSE).",
+    )
     parser.add_argument("--mxfp-backend", default="cudnn", help="flashinfer mm_fp4 backend")
     parser.add_argument(
         "--mxfp-out",
         choices=("float16", "bfloat16"),
         default="float16",
         help="MXFP output dtype and random A/B dtype (float16 matches search/w3.py defaults)",
+    )
+    parser.add_argument(
+        "--mxfp-compare",
+        choices=("real-emul", "pseudo-real"),
+        default="real-emul",
+        help="MXFP compare mode: real-emul (default) or pseudo-real (summary normalized error).",
     )
     parser.add_argument("--group-size", type=int, default=32, help="MXFP block size")
     parser.add_argument(
@@ -49,6 +61,17 @@ def main() -> int:
         "--export-verify-local",
         action="store_true",
         help="During export, also run emulation on this machine (sanity check; slower)",
+    )
+    parser.add_argument(
+        "--export-include-inputs",
+        action="store_true",
+        help="During export, include original A/B inputs in rollout state (needed for NVFP pseudo comparison on import).",
+    )
+    parser.add_argument(
+        "--import-compare",
+        choices=("emul", "pseudo"),
+        default="emul",
+        help="With --mode import: compare saved real output against emul (default) or pseudo path.",
     )
     parser.add_argument(
         "--hf-repo",
@@ -141,21 +164,51 @@ def main() -> int:
         out_dtype = torch.float16 if args.nvfp_out == "float16" else torch.bfloat16
         dtype = torch.float16
         if args.mode == "import":
-            from gemm_compare.backends.nvfp import build_nvfp_emul_fn
+            if args.import_compare == "pseudo":
+                from gemm_compare.backends.nvfp import build_nvfp_pseudo_fn
 
-            emul_fn, meta = build_nvfp_emul_fn(out_dtype=out_dtype)
-            name = f"NVFP import | {meta}"
+                compare_fn, meta = build_nvfp_pseudo_fn()
+                name = f"NVFP import pseudo | {meta}"
+                metric_mode = "mse"
+                print_iter_status = False
+            else:
+                from gemm_compare.backends.nvfp import build_nvfp_emul_fn
+
+                compare_fn, meta = build_nvfp_emul_fn(out_dtype=out_dtype)
+                name = f"NVFP import | {meta}"
+                metric_mode = "exact"
+                print_iter_status = True
             ap = import_artifact_path()
             if args.hf_repo and args.artifact is None:
                 print(f"HF Hub: using cached file {ap}")
             return run_suite_import(
-                emul_fn,
+                compare_fn,
                 backend="nvfp",
                 artifact_path=ap,
                 name=name,
                 device=args.device,
+                metric_mode=metric_mode,
+                print_iter_status=print_iter_status,
             )
         from gemm_compare.backends.nvfp import build_nvfp_fns
+
+        if args.nvfp_compare == "pseudo-real":
+            quant_fn, real_fn, emul_fn, pseudo_fn, meta = build_nvfp_fns(
+                out_dtype=out_dtype, return_pseudo=True
+            )
+            name = f"NVFP pseudo vs real | {meta}"
+            return run_suite(
+                quant_fn,
+                real_fn,
+                pseudo_fn,
+                name=name,
+                num_iterations=args.iterations,
+                device=args.device,
+                dtype=dtype,
+                seed=args.seed,
+                metric_mode="mse",
+                print_iter_status=False,
+            )
 
         quant_fn, real_fn, emul_fn, meta = build_nvfp_fns(out_dtype=out_dtype)
         name = f"NVFP | {meta}"
@@ -173,6 +226,7 @@ def main() -> int:
                 seed=args.seed,
                 verify_local=args.export_verify_local,
                 meta=meta,
+                include_inputs=args.export_include_inputs,
             )
             up = maybe_push_hf(args.artifact.expanduser().resolve())
             return up if up != 0 else ret
@@ -189,25 +243,58 @@ def main() -> int:
 
     mxfp_out = torch.float16 if args.mxfp_out == "float16" else torch.bfloat16
     if args.mode == "import":
-        from gemm_compare.backends.mxfp import build_mxfp_emul_fn
+        if args.import_compare == "pseudo":
+            from gemm_compare.backends.mxfp import build_mxfp_pseudo_fn
 
-        emul_fn, meta = build_mxfp_emul_fn(
-            group_size=args.group_size,
-            out_dtype=mxfp_out,
-        )
-        name = f"MXFP import | {meta}"
+            compare_fn, meta = build_mxfp_pseudo_fn()
+            name = f"MXFP import pseudo | {meta}"
+            metric_mode = "mse"
+            print_iter_status = False
+        else:
+            from gemm_compare.backends.mxfp import build_mxfp_emul_fn
+
+            compare_fn, meta = build_mxfp_emul_fn(
+                group_size=args.group_size,
+                out_dtype=mxfp_out,
+            )
+            name = f"MXFP import | {meta}"
+            metric_mode = "exact"
+            print_iter_status = True
         ap = import_artifact_path()
         if args.hf_repo and args.artifact is None:
             print(f"HF Hub: using cached file {ap}")
         return run_suite_import(
-            emul_fn,
+            compare_fn,
             backend="mxfp",
             artifact_path=ap,
             name=name,
             device=args.device,
+            metric_mode=metric_mode,
+            print_iter_status=print_iter_status,
         )
 
     from gemm_compare.backends.mxfp import build_mxfp_fns
+
+    if args.mxfp_compare == "pseudo-real":
+        quant_fn, real_fn, emul_fn, pseudo_fn, meta = build_mxfp_fns(
+            group_size=args.group_size,
+            out_dtype=mxfp_out,
+            mm_backend=args.mxfp_backend,
+            return_pseudo=True,
+        )
+        name = f"MXFP pseudo vs real | {meta}"
+        return run_suite(
+            quant_fn,
+            real_fn,
+            pseudo_fn,
+            name=name,
+            num_iterations=args.iterations,
+            device=args.device,
+            dtype=mxfp_out,
+            seed=args.seed,
+            metric_mode="mse",
+            print_iter_status=False,
+        )
 
     quant_fn, real_fn, emul_fn, meta = build_mxfp_fns(
         group_size=args.group_size,
@@ -229,6 +316,7 @@ def main() -> int:
             seed=args.seed,
             verify_local=args.export_verify_local,
             meta=meta,
+            include_inputs=args.export_include_inputs,
         )
         up = maybe_push_hf(args.artifact.expanduser().resolve())
         return up if up != 0 else ret

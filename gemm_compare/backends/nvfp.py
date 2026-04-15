@@ -40,6 +40,8 @@ class NVFPQuantState:
     m_chunk_size: int
     stage3_rounding: int
     stage4_rounding: int
+    a: torch.Tensor | None = None
+    b: torch.Tensor | None = None
 
 
 def _dtype_to_str(dt: torch.dtype) -> str:
@@ -52,9 +54,9 @@ def _dtype_from_str(s: str) -> torch.dtype:
     return getattr(torch, name)
 
 
-def nvfp_quant_state_to_cpu_dict(state: NVFPQuantState) -> dict[str, Any]:
+def nvfp_quant_state_to_cpu_dict(state: NVFPQuantState, *, include_inputs: bool = False) -> dict[str, Any]:
     """Portable dict (tensors on CPU) for cross-machine rollout artifacts."""
-    return {
+    out = {
         "kind": "nvfp",
         "a_fp4": state.a_fp4.detach().cpu().contiguous(),
         "b_fp4": state.b_fp4.detach().cpu().contiguous(),
@@ -68,6 +70,10 @@ def nvfp_quant_state_to_cpu_dict(state: NVFPQuantState) -> dict[str, Any]:
         "stage3_rounding": int(state.stage3_rounding),
         "stage4_rounding": int(state.stage4_rounding),
     }
+    if include_inputs and state.a is not None and state.b is not None:
+        out["a"] = state.a.detach().cpu().contiguous()
+        out["b"] = state.b.detach().cpu().contiguous()
+    return out
 
 
 def nvfp_quant_state_from_dict(d: dict[str, Any], *, device: str | torch.device) -> NVFPQuantState:
@@ -85,6 +91,8 @@ def nvfp_quant_state_from_dict(d: dict[str, Any], *, device: str | torch.device)
         m_chunk_size=int(d["m_chunk_size"]),
         stage3_rounding=int(d["stage3_rounding"]),
         stage4_rounding=int(d["stage4_rounding"]),
+        a=d["a"].to(device) if "a" in d else None,
+        b=d["b"].to(device) if "b" in d else None,
     )
 
 
@@ -123,14 +131,31 @@ def build_nvfp_emul_fn(
     return emul_fn, meta
 
 
+def build_nvfp_pseudo_fn():
+    import nvfp.pseudo_quant as pseudo_quant
+
+    def pseudo_fn(state: NVFPQuantState) -> torch.Tensor:
+        if state.a is None or state.b is None:
+            raise ValueError(
+                "NVFP pseudo import requires rollout with saved inputs. "
+                "Re-export using --mode export --export-include-inputs."
+            )
+        return pseudo_quant.nvfp4_pseudo_quantize(state.a) @ pseudo_quant.nvfp4_pseudo_quantize(state.b).T
+
+    meta: dict[str, Any] = {"backend": "nvfp", "pseudo_only": True}
+    return pseudo_fn, meta
+
+
 def build_nvfp_fns(
     *,
     out_dtype: torch.dtype = torch.float16,
     m_chunk_size: int = 128,
     stage3_rounding: int | None = None,
     stage4_rounding: int | None = None,
+    return_pseudo: bool = False,
 ):
     import nvfp.ops as ops
+    import nvfp.pseudo_quant as pseudo_quant
     from nvfp_cpp_emul import RZ
 
     if stage3_rounding is None:
@@ -155,6 +180,8 @@ def build_nvfp_fns(
         a_fp4 = a_fp4.contiguous().view(torch.uint8)
         b_fp4 = b_fp4.contiguous().view(torch.uint8)
         return NVFPQuantState(
+            a=a,
+            b=b,
             a_fp4=a_fp4,
             b_fp4=b_fp4,
             scale_a=scale_a,
@@ -168,8 +195,14 @@ def build_nvfp_fns(
             stage4_rounding=stage4_rounding,
         )
 
+    def pseudo_fn(state: NVFPQuantState) -> torch.Tensor:
+        out = pseudo_quant.nvfp4_pseudo_quantize(
+            state.a) @ pseudo_quant.nvfp4_pseudo_quantize(
+            state.b).T
+        return out
+
     def real_fn(state: NVFPQuantState) -> torch.Tensor:
-        return ops.cutlass_scaled_fp4_mm(
+        out = ops.cutlass_scaled_fp4_mm(
             state.a_fp4,
             state.b_fp4,
             state.scale_a,
@@ -177,9 +210,12 @@ def build_nvfp_fns(
             state.alpha,
             state.out_dtype,
         )
+        return out
 
     meta: dict[str, Any] = {
         "backend": "nvfp",
         "out_dtype": str(out_dtype),
     }
+    if return_pseudo:
+        return quant_fn, real_fn, emul_fn, pseudo_fn, meta
     return quant_fn, real_fn, emul_fn, meta

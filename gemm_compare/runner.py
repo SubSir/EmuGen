@@ -55,6 +55,30 @@ def compare_tensors(
     }
 
 
+def compare_mse(
+    reference: torch.Tensor,
+    target: torch.Tensor,
+) -> dict[str, Any]:
+    """Squared error stats, plus ||reference||_2 for normalization."""
+    ref_f = reference.float()
+    sq = (ref_f - target.float()).pow(2)
+    sq = torch.nan_to_num(sq, nan=0.0, posinf=0.0, neginf=0.0)
+    sq_sum = sq.sum().item()
+    sq_numel = sq.numel()
+    ref_sq_sum = torch.nan_to_num(ref_f.pow(2), nan=0.0, posinf=0.0, neginf=0.0).sum().item()
+    per_gemm_metric = (sq_sum ** 0.5) / max(ref_sq_sum ** 0.5, 1e-12)
+    return {
+        "status": "OK",
+        "mean_mse": sq_sum / max(sq_numel, 1),
+        "max_mse": sq.max().item(),
+        "mse_sum": sq_sum,
+        "mse_numel": sq_numel,
+        "real_sq_sum": ref_sq_sum,
+        "per_gemm_rel_l2_error": per_gemm_metric,
+        "mismatch_details": [],
+    }
+
+
 def run_test_case(
     iter_idx: int,
     M: int,
@@ -71,6 +95,7 @@ def run_test_case(
     dtype: torch.dtype = torch.float16,
     data_gen: Type[DataGenerator] = DataGenerator,
     extra_meta: dict[str, Any] | None = None,
+    metric_mode: str = "exact",
 ) -> dict[str, Any]:
     a = data_gen.get_random_tensor((M, K), dist_a, device=device, dtype=dtype)
     b = data_gen.get_random_tensor((N, K), dist_b, device=device, dtype=dtype)
@@ -79,7 +104,12 @@ def run_test_case(
     real_output = real_fn(state)
     modeling_res = emul_fn(state)
 
-    cmp = compare_tensors(real_output, modeling_res, sample_count=sample_count)
+    if metric_mode == "exact":
+        cmp = compare_tensors(real_output, modeling_res, sample_count=sample_count)
+    elif metric_mode == "mse":
+        cmp = compare_mse(real_output, modeling_res)
+    else:
+        raise ValueError(f"unknown metric_mode={metric_mode!r}")
     out: dict[str, Any] = {
         "iter": iter_idx,
         "M": M,
@@ -111,6 +141,7 @@ def run_test_case_export(
     dtype: torch.dtype = torch.float16,
     data_gen: Type[DataGenerator] = DataGenerator,
     verify_local: bool = False,
+    include_inputs: bool = False,
 ) -> dict[str, Any]:
     """Quantize + real GEMM; optionally verify emulation on the export machine."""
     a = data_gen.get_random_tensor((M, K), dist_a, device=device, dtype=dtype)
@@ -123,7 +154,7 @@ def run_test_case_export(
         modeling_res = emul_fn(state)
         local_check = compare_tensors(real_output, modeling_res, sample_count=sample_count)
 
-    state_dict = quant_state_to_cpu_dict(state, backend)
+    state_dict = quant_state_to_cpu_dict(state, backend, include_inputs=include_inputs)
     return {
         "iter": iter_idx,
         "M": M,
@@ -154,6 +185,8 @@ def run_suite(
     dtype: torch.dtype = torch.float16,
     data_gen: Type[DataGenerator] = DataGenerator,
     seed: int | None = None,
+    metric_mode: str = "exact",
+    print_iter_status: bool = True,
 ) -> int:
     """
     Randomized suite like legacy test.py main(). Returns 0 if all exact matches, else 1.
@@ -213,11 +246,19 @@ def run_suite(
                 device=device,
                 dtype=dtype,
                 data_gen=data_gen,
+                metric_mode=metric_mode,
             )
             results.append(res)
-            print(res["status"])
+            if print_iter_status:
+                print(res["status"])
+            else:
+                print("OK")
 
-            if res["status"] == "MISMATCH" and mismatch_print_count < max_mismatch_print:
+            if (
+                metric_mode == "exact"
+                and res["status"] == "MISMATCH"
+                and mismatch_print_count < max_mismatch_print
+            ):
                 mismatch_print_count += 1
                 print("    >>> Mismatch Details:")
                 for d in res["mismatch_details"]:
@@ -229,12 +270,25 @@ def run_suite(
             print(f"\nFATAL ERROR on Test {i + 1}: {e}")
             traceback.print_exc()
 
-    mismatches = [r for r in results if r["status"] == "MISMATCH"]
     print("\n" + "=" * 70)
     print(f"SUMMARY | {name}")
+    print("=" * 70)
+    if metric_mode == "mse":
+        total_numel = sum(int(r.get("mse_numel", 0)) for r in results)
+        total_mse_sum = sum(float(r.get("mse_sum", 0.0)) for r in results)
+        mean_mse = total_mse_sum / max(total_numel, 1)
+        per_gemm_scores = [float(r.get("per_gemm_rel_l2_error", 0.0)) for r in results]
+        mean_per_gemm_score = sum(per_gemm_scores) / max(len(per_gemm_scores), 1)
+        worst_iter_max = max((float(r.get("max_mse", 0.0)) for r in results), default=0.0)
+        print(f"Total: {num_iterations}, Completed: {len(results)}")
+        print(f"MSE mean: {mean_mse:.8e}")
+        print(f"mean over GEMMs of sqrt(sum(error^2)) / sqrt(sum(real^2)): {mean_per_gemm_score:.8e}")
+        print(f"MSE max (worst element): {worst_iter_max:.8e}")
+        return 0
+
+    mismatches = [r for r in results if r["status"] == "MISMATCH"]
     print(f"Total: {num_iterations}, Matches: {len(results) - len(mismatches)}, Mismatches: {len(mismatches)}")
     print("=" * 70)
-
     if len(mismatches) == 0:
         print("*** All tests: exact bitwise match ***")
         return 0
@@ -263,6 +317,7 @@ def run_suite_export(
     seed: int | None = None,
     verify_local: bool = False,
     meta: dict[str, Any] | None = None,
+    include_inputs: bool = False,
 ) -> int:
     """Rollout on the real-GPU machine: save quantized state + real output for replay elsewhere."""
     import os
@@ -326,6 +381,7 @@ def run_suite_export(
                 dtype=dtype,
                 data_gen=data_gen,
                 verify_local=verify_local,
+                include_inputs=include_inputs,
             )
             cases.append(row)
             tag = "OK"
@@ -372,6 +428,8 @@ def run_suite_import(
     device: str = "cuda",
     sample_count: int = 5,
     max_mismatch_print: int = 20,
+    metric_mode: str = "exact",
+    print_iter_status: bool = True,
 ) -> int:
     """Replay saved rollout: compare artifact real output vs emulation on this machine."""
     data = load_rollout_artifact(artifact_path, map_location="cpu")
@@ -406,7 +464,12 @@ def run_suite_import(
             state = quant_state_from_dict(row["state"], backend, device=device)
             real_output = row["real_output"].to(device)
             modeling_res = emul_fn(state)
-            cmp = compare_tensors(real_output, modeling_res, sample_count=sample_count)
+            if metric_mode == "exact":
+                cmp = compare_tensors(real_output, modeling_res, sample_count=sample_count)
+            elif metric_mode == "mse":
+                cmp = compare_mse(real_output, modeling_res)
+            else:
+                raise ValueError(f"unknown metric_mode={metric_mode!r}")
             out = {
                 "iter": row.get("iter", idx),
                 "M": row["M"],
@@ -417,8 +480,15 @@ def run_suite_import(
                 **cmp,
             }
             results.append(out)
-            print(out["status"])
-            if out["status"] == "MISMATCH" and mismatch_print_count < max_mismatch_print:
+            if print_iter_status:
+                print(out["status"])
+            else:
+                print("OK")
+            if (
+                metric_mode == "exact"
+                and out["status"] == "MISMATCH"
+                and mismatch_print_count < max_mismatch_print
+            ):
                 mismatch_print_count += 1
                 print("    >>> Mismatch Details:")
                 for d in out["mismatch_details"]:
@@ -430,9 +500,23 @@ def run_suite_import(
             print(f"\nFATAL ERROR on import case {idx + 1}: {e}")
             traceback.print_exc()
 
-    mismatches = [r for r in results if r["status"] == "MISMATCH"]
     print("\n" + "=" * 70)
     print(f"SUMMARY | {name}")
+    print("=" * 70)
+    if metric_mode == "mse":
+        total_numel = sum(int(r.get("mse_numel", 0)) for r in results)
+        total_mse_sum = sum(float(r.get("mse_sum", 0.0)) for r in results)
+        mean_mse = total_mse_sum / max(total_numel, 1)
+        per_gemm_scores = [float(r.get("per_gemm_rel_l2_error", 0.0)) for r in results]
+        mean_per_gemm_score = sum(per_gemm_scores) / max(len(per_gemm_scores), 1)
+        worst_iter_max = max((float(r.get("max_mse", 0.0)) for r in results), default=0.0)
+        print(f"Total: {len(cases)}, Completed: {len(results)}")
+        print(f"MSE mean: {mean_mse:.8e}")
+        print(f"mean over GEMMs of sqrt(sum(error^2)) / sqrt(sum(real^2)): {mean_per_gemm_score:.8e}")
+        print(f"MSE max (worst element): {worst_iter_max:.8e}")
+        return 0
+
+    mismatches = [r for r in results if r["status"] == "MISMATCH"]
     print(f"Total: {len(cases)}, Matches: {len(results) - len(mismatches)}, Mismatches: {len(mismatches)}")
     print("=" * 70)
     if len(mismatches) == 0:
